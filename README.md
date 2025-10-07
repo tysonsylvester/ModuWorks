@@ -1,2 +1,44 @@
 # ModuWorks
-ModuWorks is a secure, terminal-based tool for managing notes, recording audio (WAV/MP3/FLAC), and customizing user settings. It features per-user accounts, robust storage, and a user-friendly interface, combining productivity and modern functionality in one command-line powerhouse.
+
+A modern, command-line powerhouse for notes, audio recording, and more.
+
+## Features
+- User account system (username + strong password)
+- Notes management (create, open, edit, search, delete)
+- Integrated audio recorder (WAV/MP3/FLAC)
+- Settings and per-user preferences
+- Secure, fail-safe database handling
+
+## Usage
+1. Run `python moduworks.py`
+2. Create an account or log in
+3. Use the menu to create notes, record audio, or adjust settings
+
+## Storage
+All data is stored under:  
+`~/.moduworks/`  
+
+## License
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+
+---
+
+## MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
