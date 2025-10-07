@@ -1,16 +1,7 @@
 """
-ModuWorks — Modern Utilities Powerhouse
-
-Features:
-- User account system (username + strong password, supports letters, numbers, punctuation, special characters)
-- Notes management (create, open, edit, search, delete)
-- Integrated sound recorder (menu-based, pause/resume/stop, WAV)
-- Per-user settings (auto-speak, verbosity)
-- Safe, fail-proof database handling
-- Auto-update from GitHub
+ModuWorks — Modern powerhouse
+Version: 1.0.0
 """
-
-__version__ = "1.0.0"
 
 import os
 import json
@@ -22,50 +13,57 @@ import getpass
 import logging
 import threading
 import queue
+import re
 from pathlib import Path
 from datetime import datetime
 import hashlib
 import secrets
 
-# --- Sound recording dependencies ---
+# Sound recording dependencies
 try:
     import pyaudio
     import wave
+    from pydub import AudioSegment
     import keyboard
 except Exception:
-    print("Warning: pyaudio or keyboard not available. Recording will not work.")
+    print("Warning: pyaudio, keyboard, or pydub not available. Recording will not work.")
 
-# --- Logging ---
+# Setup logging
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 
-# --- Paths ---
+# ----------- Paths & Config -----------
 APP_NAME = "ModuWorks"
 APP_DIR = Path.home() / f".{APP_NAME.lower()}"
 DB_PATH = APP_DIR / "moduworks.db"
 DOCS_DIR = APP_DIR / "documents"
-APP_DIR.mkdir(exist_ok=True)
 DOCS_DIR.mkdir(exist_ok=True)
+APP_DIR.mkdir(exist_ok=True)
 
 DEFAULT_CONFIG = {
     "auto_speak": True,
     "verbosity": "normal"
 }
 
-# --- Database initialization ---
+__version__ = "1.0.0"
+
+# ---------- Database Initialization ----------
 def init_db():
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
-    # Users
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL,
-        salt TEXT NOT NULL,
-        created_at REAL NOT NULL
-    )
-    """)
-    # Notes
+    # Users table with fail-safe upgrade
+    try:
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            salt TEXT NOT NULL,
+            created_at REAL NOT NULL
+        )
+        """)
+    except sqlite3.OperationalError as e:
+        logging.warning(f"Users table issue: {e}")
+    # Notes table
     cur.execute("""
     CREATE TABLE IF NOT EXISTS notes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,7 +78,7 @@ def init_db():
     con.commit()
     con.close()
 
-# --- Password hashing ---
+# ---------- Password Hashing ----------
 def hash_password(password):
     salt = secrets.token_hex(16)
     pw_hash = hashlib.sha256((salt + password).encode('utf-8')).hexdigest()
@@ -90,7 +88,7 @@ def verify_password(stored_hash, salt, password_attempt):
     attempt_hash = hashlib.sha256((salt + password_attempt).encode('utf-8')).hexdigest()
     return stored_hash == attempt_hash
 
-# --- User account management ---
+# ---------- User Account Management ----------
 def create_user():
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
@@ -125,7 +123,13 @@ def get_user(username):
     row = cur.fetchone()
     con.close()
     if row:
-        return {"id": row[0], "username": row[1], "password_hash": row[2], "salt": row[3], "created_at": row[4]}
+        return {
+            "id": row[0],
+            "username": row[1],
+            "password_hash": row[2],
+            "salt": row[3],
+            "created_at": row[4]
+        }
     return None
 
 def login_user():
@@ -141,14 +145,17 @@ def login_user():
     print("Incorrect password.")
     return None
 
-# --- Helper ---
+# ---------- Helper Functions ----------
+def speak_and_echo(text):
+    print(text)
+
 def shorten_title(title, maxlen=60):
     title = title.strip()
     return (title[:maxlen] + "...") if len(title) > maxlen else title
 
-# --- Notes management ---
+# ---------- Notes Management ----------
 def add_note(user_id):
-    print("Creating a new note. Enter title:")
+    speak_and_echo("Creating a new note. Enter title:")
     title = input("Title: ").strip() or "Untitled"
     safe_title = "".join(c for c in title if c.isalnum() or c in (" ", "-", "_")).strip()
     filename = DOCS_DIR / (safe_title + "-" + str(int(time.time())) + ".txt")
@@ -162,7 +169,7 @@ def add_note(user_id):
     """, (user_id, title, str(filename), now, now))
     con.commit()
     con.close()
-    print(f"Note '{shorten_title(title)}' created. Opening in Notepad.")
+    speak_and_echo(f"Note '{shorten_title(title)}' created. Opening in Notepad.")
     try:
         subprocess.run(["notepad.exe", str(filename)], check=True)
         con = sqlite3.connect(DB_PATH)
@@ -170,9 +177,9 @@ def add_note(user_id):
         cur.execute("UPDATE notes SET modified_at=? WHERE filename=?", (time.time(), str(filename)))
         con.commit()
         con.close()
-        print("Saved.")
+        speak_and_echo("Saved.")
     except Exception as e:
-        print(f"Notepad closed without saving: {e}")
+        speak_and_echo(f"Notepad closed without saving: {e}")
 
 def list_notes(user_id):
     con = sqlite3.connect(DB_PATH)
@@ -189,10 +196,10 @@ def open_note_file(user_id, note_id):
     row = cur.fetchone()
     con.close()
     if not row:
-        print("Note not found.")
+        speak_and_echo("Note not found.")
         return
     filename, title = row
-    print(f"Opening note: {shorten_title(title)}")
+    speak_and_echo(f"Opening note: {shorten_title(title)}")
     try:
         subprocess.run(["notepad.exe", filename], check=True)
         con = sqlite3.connect(DB_PATH)
@@ -201,7 +208,7 @@ def open_note_file(user_id, note_id):
         con.commit()
         con.close()
     except Exception as e:
-        print(f"Notepad closed without saving: {e}")
+        speak_and_echo(f"Notepad closed without saving: {e}")
 
 def delete_note_file(user_id, note_id):
     con = sqlite3.connect(DB_PATH)
@@ -209,7 +216,7 @@ def delete_note_file(user_id, note_id):
     cur.execute("SELECT filename, title FROM notes WHERE id=? AND user_id=?", (note_id, user_id))
     row = cur.fetchone()
     if not row:
-        print("Note not found.")
+        speak_and_echo("Note not found.")
         return
     filename, title = row
     confirm = input(f"Type YES to delete '{shorten_title(title)}': ").strip().upper()
@@ -219,27 +226,28 @@ def delete_note_file(user_id, note_id):
                 os.unlink(filename)
             cur.execute("DELETE FROM notes WHERE id=? AND user_id=?", (note_id, user_id))
             con.commit()
-            print("Deleted.")
+            speak_and_echo("Deleted.")
         except Exception as e:
-            print(f"Delete failed: {e}")
+            speak_and_echo(f"Delete failed: {e}")
     else:
-        print("Cancelled.")
+        speak_and_echo("Cancelled.")
     con.close()
 
-# --- Sound recorder ---
+# ---------- Sound Recorder ----------
 def record_audio_menu():
     CHUNK = 4096
     FORMAT = pyaudio.paInt16
     RATE = 44100
 
     filename_base = input("Enter filename for recording: ").strip() or f"recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    filename_base = filename_base.replace("{timestamp}", datetime.now().strftime('%Y%m%d_%H%M%S'))
     output_file = DOCS_DIR / f"{filename_base}.wav"
 
     p = pyaudio.PyAudio()
     try:
         stream = p.open(format=FORMAT, channels=2, rate=RATE, input=True, frames_per_buffer=CHUNK)
     except Exception as e:
-        print(f"Failed to open audio stream: {e}")
+        speak_and_echo(f"Failed to open audio stream: {e}")
         p.terminate()
         return
 
@@ -271,7 +279,7 @@ def record_audio_menu():
 
     keyboard.add_hotkey('p', toggle_pause)
     keyboard.add_hotkey('s', lambda: stop_event.set())
-    print("Recording started. Press 'P' to pause/resume, 'S' to stop.")
+    speak_and_echo("Recording started. Press 'P' to pause/resume, 'S' to stop.")
     start_time = time.time()
 
     try:
@@ -288,9 +296,9 @@ def record_audio_menu():
         stop_event.set()
         writer_thread.join()
         frames_queue.join()
-        print(f"Recording saved as '{output_file}' Duration: {time.time()-start_time:.2f} seconds.")
+        speak_and_echo(f"Recording saved as '{output_file}' Duration: {time.time()-start_time:.2f} seconds.")
 
-# --- Settings ---
+# ---------- Settings ----------
 def settings_menu(user):
     while True:
         print("\n--- Settings ---")
@@ -300,53 +308,42 @@ def settings_menu(user):
         choice = input("Choice: ").strip()
         if choice == "1":
             DEFAULT_CONFIG["auto_speak"] = not DEFAULT_CONFIG.get("auto_speak")
-            print(f"Auto speak set to {'on' if DEFAULT_CONFIG['auto_speak'] else 'off'}")
+            speak_and_echo(f"Auto speak set to {'on' if DEFAULT_CONFIG['auto_speak'] else 'off'}")
         elif choice == "2":
             cur = DEFAULT_CONFIG.get("verbosity")
             nxt = {"short":"normal","normal":"verbose","verbose":"short"}[cur]
             DEFAULT_CONFIG["verbosity"] = nxt
-            print(f"Verbosity set to {nxt}")
+            speak_and_echo(f"Verbosity set to {nxt}")
         elif choice == "3" or choice=="":
             break
         else:
-            print("Unknown choice.")
+            speak_and_echo("Unknown choice.")
 
-# --- Auto-update ---
-import requests
-import shutil
+# ---------- Auto Update ----------
 def auto_update():
+    import urllib.request
+    raw_url = "https://raw.githubusercontent.com/tysonsylvester/ModuWorks/main/ModuWorks.py"
     try:
-        GITHUB_RAW_URL = "https://raw.githubusercontent.com/tysonsylvester/ModuWorks/main/ModuWorks.py"
-        resp = requests.get(GITHUB_RAW_URL, timeout=10)
-        if resp.status_code != 200:
-            print("Could not reach GitHub for updates.")
-            return
-        latest_content = resp.text
-        for line in latest_content.splitlines():
-            if line.startswith("__version__"):
-                latest_version = line.split("=")[1].strip().strip('"').strip("'")
-                break
+        with urllib.request.urlopen(raw_url) as response:
+            latest_content = response.read().decode('utf-8')
+        match = re.search(r'^__version__\s*=\s*[\'"]([^\'"]+)[\'"]', latest_content, re.MULTILINE)
+        if match:
+            latest_version = match.group(1)
         else:
             print("Could not detect version in GitHub file.")
             return
-        if latest_version == __version__:
-            return
-        print(f"New version available: {latest_version} (current: {__version__})")
-        resp = input("Do you want to update now? (y/n): ").strip().lower()
-        if resp != "y":
-            return
-        current_script = Path(__file__).resolve()
-        backup_path = current_script.with_suffix(".bak")
-        shutil.copy2(current_script, backup_path)
-        with tempfile.NamedTemporaryFile("w", delete=False, dir=current_script.parent) as tmp_file:
-            tmp_file.write(latest_content)
-            temp_path = Path(tmp_file.name)
-        shutil.move(temp_path, current_script)
-        print("Update successful! Please restart the script to use the new version.")
+        if latest_version != __version__:
+            print(f"New version available: {latest_version}. Updating...")
+            with open(__file__, 'w', encoding='utf-8') as f:
+                f.write(latest_content)
+            print("Update complete. Please restart the program.")
+            exit()
+        else:
+            print("You are running the latest version.")
     except Exception as e:
-        print(f"Update failed: {e}")
+        print(f"Auto-update failed: {e}")
 
-# --- Main Menu ---
+# ---------- Main Menu ----------
 def main_menu(user):
     while True:
         print(f"\n--- ModuWorks Main Menu (User: {user['username']}) ---")
@@ -363,7 +360,7 @@ def main_menu(user):
         elif choice == "2":
             notes = list_notes(user['id'])
             if not notes:
-                print("No notes.")
+                speak_and_echo("No notes.")
                 continue
             for n in notes:
                 nid, title, *_ = n
@@ -374,7 +371,7 @@ def main_menu(user):
         elif choice == "3":
             notes = list_notes(user['id'])
             if not notes:
-                print("No notes.")
+                speak_and_echo("No notes.")
                 continue
             for n in notes:
                 nid, title, *_ = n
@@ -387,19 +384,18 @@ def main_menu(user):
         elif choice == "5":
             settings_menu(user)
         elif choice == "6":
-            print("Logging out.")
+            speak_and_echo("Logging out.")
             break
         elif choice == "7" or choice.lower() in ("q", "quit", "exit"):
-            print("Goodbye.")
+            speak_and_echo("Goodbye.")
             exit()
         else:
-            print("Unknown option.")
+            speak_and_echo("Unknown option.")
 
-# --- Bootstrap ---
+# ---------- Bootstrap ----------
 def bootstrap():
     init_db()
-    print(f"Welcome to {APP_NAME} (version {__version__})")
-    auto_update()
+    print(f"Welcome to {APP_NAME}")
     while True:
         print("\nPlease choose from one of the following options:")
         print("1) Login")
