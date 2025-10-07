@@ -1,6 +1,6 @@
 """
 ModuWorks — Modern powerhouse
-Version: 1.1.1
+Version: 1.3.0
 """
 
 import os
@@ -20,15 +20,17 @@ from pathlib import Path
 from datetime import datetime
 import hashlib
 import secrets
+import select
 
-# Sound recording dependencies
+# Sound recording and audio conversion dependencies
 try:
     import pyaudio
     import wave
-    import keyboard
-except ImportError:
-    print("Warning: pyaudio, keyboard, or wave not available. Recording will not work.")
-    pyaudio = wave = keyboard = None
+    from pydub import AudioSegment
+    # Note: pydub requires the external FFmpeg or Libav to be installed and in the system PATH.
+except ImportError as e:
+    print(f"Warning: Audio dependencies (pyaudio, pydub) not available. Recording/Conversion will not work. Error: {e}")
+    pyaudio = wave = AudioSegment = None
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
@@ -46,10 +48,12 @@ DEFAULT_CONFIG = {
     "auto_speak": False,
     "verbosity": "normal"
 }
-# Global configuration dictionary, loaded from file at startup
 CONFIG = DEFAULT_CONFIG.copy()
 
-__version__ = "1.1.1" # UPDATED VERSION NUMBER
+__version__ = "1.2.0" # Current Version
+
+# A queue to handle reminders
+REMINDER_QUEUE = queue.Queue()
 
 # ---------- Config Management ----------
 def load_config():
@@ -63,7 +67,7 @@ def load_config():
             logging.info("Configuration loaded.")
         except Exception as e:
             logging.error(f"Failed to load config: {e}")
-    save_config() # Ensures config file exists with defaults if load failed
+    save_config()
 
 def save_config():
     """Saves current global config to JSON file."""
@@ -73,24 +77,23 @@ def save_config():
     except Exception as e:
         logging.error(f"Failed to save config: {e}")
 
-# ---------- Database Initialization ----------
+# ---------- Database Initialization and Tagging Table (FIXED) ----------
 def init_db():
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
-    # Users table
-    try:
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            salt TEXT NOT NULL,
-            created_at REAL NOT NULL
-        )
-        """)
-    except sqlite3.OperationalError as e:
-        logging.warning(f"Users table issue: {e}")
-    # Notes table with ON DELETE CASCADE for better data integrity
+
+    # Users table (unchanged)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        salt TEXT NOT NULL,
+        created_at REAL NOT NULL
+    )
+    """)
+
+    # Notes table (CREATE TABLE is included in case the DB is new)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS notes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -99,13 +102,35 @@ def init_db():
         filename TEXT NOT NULL,
         created_at REAL NOT NULL,
         modified_at REAL NOT NULL,
+        reminder_time REAL NULL,
         FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
     )
     """)
+
+    # 🟢 DATABASE MIGRATION STEP: Safely add the missing 'reminder_time' column
+    try:
+        cur.execute("ALTER TABLE notes ADD COLUMN reminder_time REAL NULL")
+        logging.info("Database migration: Added 'reminder_time' column to 'notes' table.")
+    except sqlite3.OperationalError as e:
+        # Ignore "duplicate column name" error if the column already exists
+        if "duplicate column name" not in str(e):
+             logging.warning(f"Unexpected DB migration error: {e}")
+    # -------------------------------------------------------------------
+
+    # Tags table
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS tags (
+        note_id INTEGER NOT NULL,
+        tag TEXT NOT NULL,
+        PRIMARY KEY (note_id, tag),
+        FOREIGN KEY(note_id) REFERENCES notes(id) ON DELETE CASCADE
+    )
+    """)
+
     con.commit()
     con.close()
 
-# ---------- Password Hashing ----------
+# ---------- Password Hashing and User Management (Unchanged) ----------
 def hash_password(password):
     salt = secrets.token_hex(16)
     pw_hash = hashlib.sha256((salt + password).encode('utf-8')).hexdigest()
@@ -113,10 +138,8 @@ def hash_password(password):
 
 def verify_password(stored_hash, salt, password_attempt):
     attempt_hash = hashlib.sha256((salt + password_attempt).encode('utf-8')).hexdigest()
-    # SECURITY FIX: Use compare_digest to mitigate timing attacks
     return secrets.compare_digest(stored_hash, attempt_hash)
 
-# ---------- User Account Management ----------
 def get_user(username):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
@@ -173,12 +196,10 @@ def login_user():
     print("Incorrect password.")
     return None
 
-# ---------- Helper Functions ----------
+# ---------- Helper Functions and Note Management (Updated) ----------
 def speak_and_echo(text):
-    """Prints text and optionally speaks it based on config."""
     print(text)
     if CONFIG.get("auto_speak"):
-        # Placeholder for actual TTS implementation
         pass
 
 def shorten_title(title, maxlen=60):
@@ -186,23 +207,17 @@ def shorten_title(title, maxlen=60):
     return (title[:maxlen] + "...") if len(title) > maxlen else title
 
 def open_editor(file_path):
-    """
-    Opens the specified file using a cross-platform method.
-    """
     file_path = str(file_path)
     try:
         if sys.platform == 'win32':
-            # Windows: use startfile to open with default editor (Notepad)
             os.startfile(file_path)
         elif sys.platform == 'darwin':
-            # macOS: use 'open' command
             subprocess.run(['open', file_path], check=True)
         else:
-            # Linux/other Unix: try common terminal editors
-            editor = os.environ.get('EDITOR', 'vi') # Fallback to vi
+            editor = os.environ.get('EDITOR', 'vi')
             subprocess.run([editor, file_path], check=True)
     except FileNotFoundError:
-        speak_and_echo(f"Error: Default editor or '{editor}' not found on system. You must edit the file manually at: {file_path}")
+        speak_and_echo(f"Error: Default editor or '{editor}' not found. Edit manually at: {file_path}")
         return False
     except subprocess.CalledProcessError as e:
         speak_and_echo(f"Error opening editor: The editor process failed. {e}")
@@ -212,12 +227,56 @@ def open_editor(file_path):
         return False
     return True
 
-# ---------- Notes Management ----------
+def get_note_tags(note_id):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT tag FROM tags WHERE note_id = ?", (note_id,))
+    tags = [row[0] for row in cur.fetchall()]
+    con.close()
+    return tags
+
+def list_notes(user_id, search_term=None):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    query = """
+        SELECT DISTINCT n.id, n.title, n.filename, n.created_at, n.modified_at, n.reminder_time
+        FROM notes n
+        LEFT JOIN tags t ON n.id = t.note_id
+        WHERE n.user_id=?
+    """
+    params = [user_id]
+    
+    if search_term:
+        # Simple text and tag search
+        query += " AND (n.title LIKE ? OR t.tag LIKE ?)"
+        params.extend([f"%{search_term}%", f"%{search_term}%"])
+        
+    query += " ORDER BY n.modified_at DESC"
+    
+    cur.execute(query, params)
+    rows = cur.fetchall()
+    con.close()
+    
+    notes = []
+    for row in rows:
+        note_id = row[0]
+        reminder_time = row[5]
+        
+        notes.append({
+            "id": note_id, 
+            "title": row[1], 
+            "filename": row[2], 
+            "created_at": row[3], 
+            "modified_at": row[4], 
+            "reminder_time": reminder_time,
+            "tags": get_note_tags(note_id) # Fetch tags separately
+        })
+    return notes
+
 def add_note(user_id):
     speak_and_echo("Creating a new note. Enter title:")
     title = input("Title: ").strip() or f"Untitled Note ({datetime.now().strftime('%Y-%m-%d')})"
     
-    # Create a cleaner, unique filename
     safe_title = re.sub(r'[^\w\s-]', '', title).strip().replace(' ', '_')
     filename = DOCS_DIR / f"{safe_title}_{secrets.token_hex(4)}.txt"
     try:
@@ -232,13 +291,13 @@ def add_note(user_id):
     
     try:
         cur.execute("""
-            INSERT INTO notes (user_id, title, filename, created_at, modified_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO notes (user_id, title, filename, created_at, modified_at, reminder_time)
+            VALUES (?, ?, ?, ?, ?, NULL)
         """, (user_id, title, str(filename), now, now))
         con.commit()
+        note_id = cur.lastrowid
     except sqlite3.Error as e:
         speak_and_echo(f"Database error creating note: {e}")
-        # Clean up the file if DB insertion failed
         if os.path.exists(filename):
              os.unlink(filename)
         return
@@ -248,30 +307,14 @@ def add_note(user_id):
     speak_and_echo(f"Note '{shorten_title(title)}' created. Opening editor.")
     
     if open_editor(str(filename)):
-        # Only update modification time if the editor was successfully launched
         con = sqlite3.connect(DB_PATH)
         cur = con.cursor()
-        cur.execute("UPDATE notes SET modified_at=? WHERE filename=?", (time.time(), str(filename)))
+        cur.execute("UPDATE notes SET modified_at=? WHERE id=?", (time.time(), note_id))
         con.commit()
         con.close()
         speak_and_echo("Saved and updated timestamp.")
     else:
         speak_and_echo("Could not open editor. Note created, but file was not modified.")
-
-def list_notes(user_id):
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute("SELECT id, title, filename, created_at, modified_at FROM notes WHERE user_id=? ORDER BY modified_at DESC", (user_id,))
-    rows = cur.fetchall()
-    con.close()
-    # Return a list of dicts for easier consumption
-    return [{
-        "id": row[0], 
-        "title": row[1], 
-        "filename": row[2], 
-        "created_at": row[3], 
-        "modified_at": row[4]
-    } for row in rows]
 
 def open_note_file(user_id, note_id):
     con = sqlite3.connect(DB_PATH)
@@ -288,7 +331,6 @@ def open_note_file(user_id, note_id):
     speak_and_echo(f"Opening note: {shorten_title(title)}")
     
     if open_editor(filename):
-        # Update modification time after successful edit
         con = sqlite3.connect(DB_PATH)
         cur = con.cursor()
         cur.execute("UPDATE notes SET modified_at=? WHERE id=?", (time.time(), note_id))
@@ -312,20 +354,16 @@ def delete_note_file(user_id, note_id):
     
     if confirm == "YES":
         try:
-            # 1. Delete file from disk
             if Path(filename).exists():
                 os.unlink(filename)
             
-            # 2. Delete record from database
             cur.execute("DELETE FROM notes WHERE id=? AND user_id=?", (note_id, user_id))
             con.commit()
             speak_and_echo(f"Note '{shorten_title(title)}' deleted successfully.")
             
         except OSError as e:
-            # Better Error Handling
             speak_and_echo(f"File deletion failed: Check permissions. Error: {e}")
         except sqlite3.Error as e:
-            # Better Error Handling
             speak_and_echo(f"Database update failed. Error: {e}")
         except Exception:
              speak_and_echo("An unexpected error occurred during deletion.")
@@ -334,20 +372,179 @@ def delete_note_file(user_id, note_id):
         
     con.close()
 
-# ---------- Sound Recorder ----------
+# ---------- Tagging System ----------
+def manage_tags(user_id, note_id, notes_dict):
+    if str(note_id) not in notes_dict:
+        speak_and_echo("Invalid note ID.")
+        return
+        
+    note = notes_dict[str(note_id)]
+    current_tags = get_note_tags(note_id)
+    speak_and_echo(f"\n--- Managing Tags for: {shorten_title(note['title'])} ---")
+    speak_and_echo(f"Current Tags: {', '.join(current_tags) or 'None'}")
+    
+    action = input("Action (add <tag>, remove <tag>, or Back): ").strip()
+    if not action or action.lower() == 'back':
+        return
+
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    
+    try:
+        if action.lower().startswith('add '):
+            tag = action[4:].strip().lower()
+            if not tag: raise ValueError("Tag cannot be empty.")
+            cur.execute("INSERT OR IGNORE INTO tags (note_id, tag) VALUES (?, ?)", (note_id, tag))
+            speak_and_echo(f"Tag '{tag}' added.")
+            
+        elif action.lower().startswith('remove '):
+            tag = action[7:].strip().lower()
+            if not tag: raise ValueError("Tag cannot be empty.")
+            cur.execute("DELETE FROM tags WHERE note_id=? AND tag=?", (note_id, tag))
+            if cur.rowcount == 0:
+                speak_and_echo(f"Tag '{tag}' was not found on this note.")
+            else:
+                speak_and_echo(f"Tag '{tag}' removed.")
+                
+        else:
+            speak_and_echo("Invalid tag action.")
+            
+        con.commit()
+    except Exception as e:
+        speak_and_echo(f"Error managing tags: {e}")
+    finally:
+        con.close()
+
+# ---------- Reminder System ----------
+def manage_reminder(user_id, note_id, notes_dict):
+    if str(note_id) not in notes_dict:
+        speak_and_echo("Invalid note ID.")
+        return
+    
+    note = notes_dict[str(note_id)]
+    
+    if note['reminder_time']:
+        dt = datetime.fromtimestamp(note['reminder_time'])
+        speak_and_echo(f"Current Reminder: {dt.strftime('%Y-%m-%d %H:%M:%S')}")
+    else:
+        speak_and_echo("No current reminder set.")
+        
+    speak_and_echo("Enter new time (YYYY-MM-DD HH:MM), 'clear', or 'back':")
+    user_input = input("Reminder: ").strip()
+    
+    if user_input.lower() == 'back' or not user_input:
+        return
+    
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    
+    try:
+        if user_input.lower() == 'clear':
+            timestamp = None
+            speak_and_echo("Reminder cleared.")
+        else:
+            # Simple parsing of date/time
+            dt_obj = datetime.strptime(user_input, '%Y-%m-%d %H:%M')
+            timestamp = dt_obj.timestamp()
+            if timestamp <= time.time():
+                raise ValueError("Reminder time must be in the future.")
+            speak_and_echo(f"Reminder set for: {dt_obj.strftime('%Y-%m-%d %H:%M')}")
+        
+        cur.execute("UPDATE notes SET reminder_time=? WHERE id=?", (timestamp, note_id))
+        con.commit()
+        
+        # Force a refresh in the reminder thread by adding a dummy item
+        REMINDER_QUEUE.put({"type": "refresh"}) 
+        
+    except ValueError as e:
+        speak_and_echo(f"Error: {e}. Format must be YYYY-MM-DD HH:MM.")
+    except Exception as e:
+        speak_and_echo(f"Database error: {e}")
+    finally:
+        con.close()
+
+def reminder_worker(user_id):
+    """Background thread to check and trigger reminders."""
+    while True:
+        try:
+            # Check the queue for termination/refresh signals
+            if not REMINDER_QUEUE.empty():
+                item = REMINDER_QUEUE.get_nowait()
+                if item.get("type") == "terminate":
+                    break
+                if item.get("type") == "refresh":
+                    pass 
+            
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+            
+            # Find notes with reminder_time in the past but not yet triggered
+            now = time.time()
+            cur.execute("""
+                SELECT id, title FROM notes 
+                WHERE user_id=? AND reminder_time IS NOT NULL AND reminder_time < ?
+            """, (user_id, now))
+            
+            reminders = cur.fetchall()
+            
+            for note_id, title in reminders:
+                # IMPORTANT: Print immediately followed by a newline to ensure it's visible over user input
+                print(f"\n🔔 REMINDER: {shorten_title(title, 40)} (Note ID: {note_id})")
+                
+                # Clear the reminder time so it doesn't trigger again
+                cur.execute("UPDATE notes SET reminder_time=NULL WHERE id=?", (note_id,))
+                con.commit()
+                
+            con.close()
+            time.sleep(10) # Check every 10 seconds
+            
+        except sqlite3.Error as e:
+            # Now that the migration is fixed, this should be rare
+            logging.error(f"Reminder thread DB error: {e}")
+            time.sleep(30)
+        except Exception as e:
+            logging.error(f"Reminder thread general error: {e}")
+            time.sleep(30)
+            
+# ---------- Sound Recorder & Converter ----------
+def convert_wav_to_mp3(wav_path):
+    if not AudioSegment:
+        speak_and_echo("Conversion failed: pydub is not imported.")
+        return
+    try:
+        mp3_path = wav_path.with_suffix('.mp3')
+        speak_and_echo(f"Converting to MP3: {wav_path.name} -> {mp3_path.name}...")
+        
+        audio = AudioSegment.from_wav(str(wav_path))
+        audio.export(str(mp3_path), format="mp3")
+        
+        # Delete the original WAV file to save space
+        os.unlink(wav_path)
+        speak_and_echo("Conversion successful. Original WAV file deleted.")
+        
+    except FileNotFoundError:
+        speak_and_echo("Conversion failed: FFmpeg (or Libav) not found. Please install it and ensure it's in your PATH.")
+    except Exception as e:
+        speak_and_echo(f"Conversion failed: {e}")
+
+def get_input_non_blocking(timeout=0.1):
+    """Checks for console input without blocking the thread."""
+    if sys.stdin in select.select([sys.stdin], [], [], timeout)[0]:
+        return sys.stdin.readline().strip()
+    return None
+
 def record_audio_menu():
-    if not (pyaudio and wave and keyboard):
-        speak_and_echo("Audio recording dependencies are not installed. Please check warnings at startup.")
+    if not (pyaudio and wave and AudioSegment):
+        speak_and_echo("Audio recording/conversion dependencies are not available.")
         return
         
     CHUNK = 4096
     FORMAT = pyaudio.paInt16
     RATE = 44100
     CHANNELS = 2
-    
-    # Input for filename
+
     filename_base = input("Enter filename for recording: ").strip() or f"recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    output_file = DOCS_DIR / f"{filename_base}.wav"
+    wav_file = DOCS_DIR / f"{filename_base}.wav"
 
     p = pyaudio.PyAudio()
     try:
@@ -359,18 +556,17 @@ def record_audio_menu():
 
     frames_queue = queue.Queue()
     stop_event = threading.Event()
-    paused = threading.Event() # Using Event for pause state
+    paused = threading.Event()
 
     def audio_writer():
         try:
-            wf = wave.open(str(output_file), 'wb')
+            wf = wave.open(str(wav_file), 'wb')
             wf.setnchannels(CHANNELS)
             wf.setsampwidth(p.get_sample_size(FORMAT))
             wf.setframerate(RATE)
             while not stop_event.is_set() or not frames_queue.empty():
                 try:
-                    # Timeout prevents writer from blocking indefinitely
-                    data = frames_queue.get(timeout=0.1) 
+                    data = frames_queue.get(timeout=0.1)
                     wf.writeframes(data)
                     frames_queue.task_done()
                 except queue.Empty:
@@ -384,48 +580,51 @@ def record_audio_menu():
     writer_thread = threading.Thread(target=audio_writer)
     writer_thread.start()
 
-    def toggle_pause():
-        if paused.is_set():
-            paused.clear()
-            print("Resumed")
-        else:
-            paused.set()
-            print("Paused")
-
-    # Hook up hotkeys
-    keyboard.add_hotkey('p', toggle_pause)
-    keyboard.add_hotkey('s', lambda: stop_event.set())
-    speak_and_echo("Recording started. Press 'P' to pause/resume, 'S' to stop.")
+    speak_and_echo("Recording started. Type 'P' to pause/resume, 'S' to stop.")
     start_time = time.time()
-
+    
     try:
         while not stop_event.is_set():
+            # Check for command input
+            cmd = get_input_non_blocking(timeout=0.01) # Small timeout for responsiveness
+            if cmd and cmd.upper() == 'P':
+                if paused.is_set():
+                    paused.clear()
+                    print("Resumed")
+                else:
+                    paused.set()
+                    print("Paused")
+            elif cmd and cmd.upper() == 'S':
+                stop_event.set()
+                
+            # Audio capture logic
             if not paused.is_set():
-                # Read audio data
                 data = stream.read(CHUNK, exception_on_overflow=False)
                 frames_queue.put(data)
             else:
-                # FIX: Prevents 100% CPU usage when paused.
-                time.sleep(0.1) 
+                time.sleep(0.1)
                 
-    except KeyboardInterrupt:
-        stop_event.set()
     except Exception as e:
         speak_and_echo(f"Recording error: {e}")
         stop_event.set()
     finally:
-        # Cleanup hotkeys and resources
-        keyboard.remove_hotkey('p')
-        keyboard.remove_hotkey('s')
         stream.stop_stream()
         stream.close()
         p.terminate()
         stop_event.set()
         writer_thread.join()
         frames_queue.join()
-        speak_and_echo(f"Recording saved as '{output_file}' Duration: {time.time()-start_time:.2f} seconds.")
+        
+        duration = time.time()-start_time
+        speak_and_echo(f"Recording saved as '{wav_file.name}'. Duration: {duration:.2f} seconds.")
+        
+        # Conversion prompt
+        if duration > 1.0: # Only convert recordings longer than 1 sec
+            convert = input("Convert to MP3 and delete WAV? (y/n): ").strip().lower()
+            if convert == 'y':
+                convert_wav_to_mp3(wav_file)
 
-# ---------- Settings ----------
+# ---------- Settings and Update (Same as 1.1.1) ----------
 def settings_menu(user):
     while True:
         print("\n--- Settings ---")
@@ -439,17 +638,15 @@ def settings_menu(user):
             speak_and_echo(f"Auto speak set to {'ON' if CONFIG['auto_speak'] else 'OFF'}")
         elif choice == "2":
             cur = CONFIG.get("verbosity")
-            # Simple cyclic switching
             nxt = {"short":"normal","normal":"verbose","verbose":"short"}.get(cur, "normal")
             CONFIG["verbosity"] = nxt
             speak_and_echo(f"Verbosity set to {nxt.upper()}")
         elif choice == "3" or choice == "":
-            save_config() # Saves changes before exiting
+            save_config()
             break
         else:
             speak_and_echo("Unknown choice.")
 
-# ---------- Auto Update ----------
 def auto_update():
     raw_url = "https://raw.githubusercontent.com/tysonsylvester/ModuWorks/main/ModuWorks.py"
     
@@ -458,7 +655,6 @@ def auto_update():
         with urllib.request.urlopen(raw_url, timeout=5) as response:
             latest_content = response.read().decode('utf-8')
         
-        # Check the explicit __version__ variable for the latest version
         match = re.search(r'^__version__\s*=\s*[\'"]([^\'"]+)[\'"]', latest_content, re.MULTILINE)
         
         if match:
@@ -470,14 +666,13 @@ def auto_update():
         if latest_version != __version__:
             print(f"New version available: {latest_version}. Your version: {__version__}. Updating...")
             
-            # Critical: Get the path of the currently running file
             current_file_path = os.path.abspath(__file__)
             
             with open(current_file_path, 'w', encoding='utf-8') as f:
                 f.write(latest_content)
                 
             print("\n*** Update complete! Please restart the program to use the new version. ***")
-            exit() # Force exit after successful update
+            exit()
         else:
             print("You are running the latest version.")
             
@@ -488,10 +683,13 @@ def auto_update():
 
 # ---------- Main Menu ----------
 def main_menu(user):
+    reminder_thread = threading.Thread(target=reminder_worker, args=(user['id'],), daemon=True)
+    reminder_thread.start()
+
     while True:
         print(f"\n--- ModuWorks Main Menu (User: {user['username']}) | v{__version__} ---")
         print("1) New Note")
-        print("2) List / Open Notes")
+        print("2) List / View / Manage Notes")
         print("3) Delete Note")
         print("4) Record Audio")
         print("5) Settings")
@@ -505,27 +703,46 @@ def main_menu(user):
         if choice == "1":
             add_note(user_id)
         
-        # Combined List, Open, and Delete logic to avoid redundant queries
         elif choice == "2" or choice == "3":
-            notes = list_notes(user_id)
+            
+            search = input("Search by keyword/tag (optional, press Enter to list all): ").strip()
+            notes = list_notes(user_id, search_term=search)
+            
             if not notes:
-                speak_and_echo("No notes found.")
+                speak_and_echo("No notes found matching criteria.")
                 continue
                 
             print("\nAvailable Notes:")
             notes_dict = {}
             for n in notes:
-                # Store notes in a dictionary for quick lookup by ID (string key)
                 notes_dict[str(n['id'])] = n
                 mod_time = datetime.fromtimestamp(n['modified_at']).strftime('%Y-%m-%d %H:%M')
-                print(f"[{n['id']:<3}] {shorten_title(n['title'], 50):<52} (Modified: {mod_time})")
+                reminder = datetime.fromtimestamp(n['reminder_time']).strftime('⏰ %m/%d %H:%M') if n['reminder_time'] else ''
+                tags = f"[{', '.join(n['tags'])}]" if n['tags'] else ''
+                
+                print(f"[{n['id']:<3}] {shorten_title(n['title'], 40):<42} {tags:<20} {reminder:<15} (Mod: {mod_time})")
 
             if choice == "2":
-                sub = input("Enter note ID to open or Enter to cancel: ").strip()
-                if sub.isdigit() and sub in notes_dict:
-                    open_note_file(user_id, int(sub))
-                elif sub:
-                     speak_and_echo("Invalid ID or cancelled.")
+                sub = input("Enter note ID to (O)pen, (T)ag, (R)emind, or Enter to cancel: ").strip().lower()
+                if not sub:
+                    continue
+                    
+                parts = sub.split()
+                note_id_str = parts[0]
+                action = parts[1] if len(parts) > 1 else 'o' # Default to open
+                
+                if note_id_str.isdigit() and note_id_str in notes_dict:
+                    note_id = int(note_id_str)
+                    if action == 'o':
+                        open_note_file(user_id, note_id)
+                    elif action == 't':
+                        manage_tags(user_id, note_id, notes_dict)
+                    elif action == 'r':
+                        manage_reminder(user_id, note_id, notes_dict)
+                    else:
+                        speak_and_echo("Invalid action. Use O, T, or R.")
+                else:
+                    speak_and_echo("Invalid ID or action.")
                      
             elif choice == "3":
                 sub = input("Enter note ID to delete or Enter to cancel: ").strip()
@@ -541,9 +758,13 @@ def main_menu(user):
         elif choice == "6":
             auto_update()
         elif choice == "7":
+            # Signal the reminder thread to terminate gracefully
+            REMINDER_QUEUE.put({"type": "terminate"})
             speak_and_echo("Logging out.")
             break
         elif choice == "8" or choice.lower() in ("q", "quit", "exit"):
+            # Signal the reminder thread to terminate gracefully
+            REMINDER_QUEUE.put({"type": "terminate"})
             speak_and_echo("Goodbye.")
             exit()
         else:
