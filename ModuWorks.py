@@ -1,17 +1,19 @@
 """
-ModuWorks — Modern productivity utility
+ModuWorks — Modern Utilities Powerhouse
 
 Features:
-- User account system (username + strong password)
-- Notes management (create, open, edit, delete)
-- Integrated sound recorder (menu-based, pause/resume/stop, WAV/MP3/FLAC)
+- User account system (username + strong password, supports letters, numbers, punctuation, special characters)
+- Notes management (create, open, edit, search, delete)
+- Integrated sound recorder (menu-based, pause/resume/stop, WAV)
 - Per-user settings (auto-speak, verbosity)
-- Persistent storage and secure database handling
-- Help system with subcategories
-- Open ModuWorks folders directly
+- Safe, fail-proof database handling
+- Auto-update from GitHub
 """
 
+__version__ = "1.0.0"
+
 import os
+import json
 import sqlite3
 import subprocess
 import tempfile
@@ -25,38 +27,35 @@ from datetime import datetime
 import hashlib
 import secrets
 
-# Sound recording dependencies
+# --- Sound recording dependencies ---
 try:
     import pyaudio
     import wave
-    from pydub import AudioSegment
     import keyboard
-except ImportError:
-    print("Warning: pyaudio, keyboard, or pydub not available. Recording will not work.")
+except Exception:
+    print("Warning: pyaudio or keyboard not available. Recording will not work.")
 
-# Setup logging
+# --- Logging ---
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 
-# ----------- Paths & Config -----------
+# --- Paths ---
 APP_NAME = "ModuWorks"
 APP_DIR = Path.home() / f".{APP_NAME.lower()}"
 DB_PATH = APP_DIR / "moduworks.db"
 DOCS_DIR = APP_DIR / "documents"
-RECS_DIR = APP_DIR / "recordings"
-DOCS_DIR.mkdir(parents=True, exist_ok=True)
-RECS_DIR.mkdir(parents=True, exist_ok=True)
-APP_DIR.mkdir(parents=True, exist_ok=True)
+APP_DIR.mkdir(exist_ok=True)
+DOCS_DIR.mkdir(exist_ok=True)
 
 DEFAULT_CONFIG = {
     "auto_speak": True,
     "verbosity": "normal"
 }
 
-# ---------- Database Initialization ----------
+# --- Database initialization ---
 def init_db():
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
-    # Users table with upgrade handling
+    # Users
     cur.execute("""
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,7 +65,7 @@ def init_db():
         created_at REAL NOT NULL
     )
     """)
-    # Notes table
+    # Notes
     cur.execute("""
     CREATE TABLE IF NOT EXISTS notes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,7 +80,7 @@ def init_db():
     con.commit()
     con.close()
 
-# ---------- Password Hashing ----------
+# --- Password hashing ---
 def hash_password(password):
     salt = secrets.token_hex(16)
     pw_hash = hashlib.sha256((salt + password).encode('utf-8')).hexdigest()
@@ -91,7 +90,7 @@ def verify_password(stored_hash, salt, password_attempt):
     attempt_hash = hashlib.sha256((salt + password_attempt).encode('utf-8')).hexdigest()
     return stored_hash == attempt_hash
 
-# ---------- User Account Management ----------
+# --- User account management ---
 def create_user():
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
@@ -126,13 +125,7 @@ def get_user(username):
     row = cur.fetchone()
     con.close()
     if row:
-        return {
-            "id": row[0],
-            "username": row[1],
-            "password_hash": row[2],
-            "salt": row[3],
-            "created_at": row[4]
-        }
+        return {"id": row[0], "username": row[1], "password_hash": row[2], "salt": row[3], "created_at": row[4]}
     return None
 
 def login_user():
@@ -148,13 +141,15 @@ def login_user():
     print("Incorrect password.")
     return None
 
-# ---------- Notes Management ----------
+# --- Helper ---
 def shorten_title(title, maxlen=60):
     title = title.strip()
     return (title[:maxlen] + "...") if len(title) > maxlen else title
 
+# --- Notes management ---
 def add_note(user_id):
-    title = input("Enter note title: ").strip() or "Untitled"
+    print("Creating a new note. Enter title:")
+    title = input("Title: ").strip() or "Untitled"
     safe_title = "".join(c for c in title if c.isalnum() or c in (" ", "-", "_")).strip()
     filename = DOCS_DIR / (safe_title + "-" + str(int(time.time())) + ".txt")
     filename.write_text("", encoding="utf-8")
@@ -167,7 +162,7 @@ def add_note(user_id):
     """, (user_id, title, str(filename), now, now))
     con.commit()
     con.close()
-    print(f"Note '{shorten_title(title)}' created. Opening...")
+    print(f"Note '{shorten_title(title)}' created. Opening in Notepad.")
     try:
         subprocess.run(["notepad.exe", str(filename)], check=True)
         con = sqlite3.connect(DB_PATH)
@@ -231,16 +226,14 @@ def delete_note_file(user_id, note_id):
         print("Cancelled.")
     con.close()
 
-# ---------- Sound Recorder ----------
+# --- Sound recorder ---
 def record_audio_menu():
-    if not all([pyaudio, wave, keyboard]):
-        print("Recording dependencies missing.")
-        return
     CHUNK = 4096
     FORMAT = pyaudio.paInt16
     RATE = 44100
+
     filename_base = input("Enter filename for recording: ").strip() or f"recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    output_file = RECS_DIR / f"{filename_base}.wav"
+    output_file = DOCS_DIR / f"{filename_base}.wav"
 
     p = pyaudio.PyAudio()
     try:
@@ -297,15 +290,13 @@ def record_audio_menu():
         frames_queue.join()
         print(f"Recording saved as '{output_file}' Duration: {time.time()-start_time:.2f} seconds.")
 
-# ---------- Settings ----------
+# --- Settings ---
 def settings_menu(user):
     while True:
         print("\n--- Settings ---")
         print(f"1) Auto Speak (currently: {'on' if DEFAULT_CONFIG.get('auto_speak') else 'off'})")
         print(f"2) Verbosity (currently: {DEFAULT_CONFIG.get('verbosity')})")
-        print(f"3) Open ModuWorks Documents Folder")
-        print(f"4) Open ModuWorks Recordings Folder")
-        print("5) Back")
+        print("3) Back")
         choice = input("Choice: ").strip()
         if choice == "1":
             DEFAULT_CONFIG["auto_speak"] = not DEFAULT_CONFIG.get("auto_speak")
@@ -315,67 +306,47 @@ def settings_menu(user):
             nxt = {"short":"normal","normal":"verbose","verbose":"short"}[cur]
             DEFAULT_CONFIG["verbosity"] = nxt
             print(f"Verbosity set to {nxt}")
-        elif choice == "3":
-            os.startfile(DOCS_DIR)
-        elif choice == "4":
-            os.startfile(RECS_DIR)
-        elif choice == "5" or choice=="":
+        elif choice == "3" or choice=="":
             break
         else:
             print("Unknown choice.")
 
-# ---------- Help ----------
-def help_menu():
-    while True:
-        print("\n--- Help Menu ---")
-        print("1) Notes")
-        print("2) Recording")
-        print("3) Settings")
-        print("4) File Management")
-        print("5) About")
-        print("6) Back")
-        choice = input("Choice: ").strip()
-        if choice == "1":
-            print(f"""
-Notes Help:
-- Create new notes with option 'New Note'.
-- List and open notes with 'List / Open Notes'.
-- Delete unwanted notes with 'Delete Note'.
-- Notes are stored in: {DOCS_DIR}
-""")
-        elif choice == "2":
-            print(f"""
-Recording Help:
-- Audio recordings are saved in WAV format: {RECS_DIR}
-- Press 'P' to pause/resume during recording.
-- Press 'S' to stop recording.
-""")
-        elif choice == "3":
-            print("""
-Settings Help:
-- Toggle Auto Speak on/off.
-- Adjust verbosity: short / normal / verbose.
-""")
-        elif choice == "4":
-            print(f"""
-File Management:
-- Documents folder: {DOCS_DIR}
-- Recordings folder: {RECS_DIR}
-- Use 'Settings' menu to open folders directly.
-""")
-        elif choice == "5":
-            print("""
-About ModuWorks:
-- Version: 1.0
-- Productivity utility for notes, recordings, and personal settings.
-- Fully persistent, secure, and user-friendly.
-""")
-        elif choice == "6" or choice=="":
-            break
+# --- Auto-update ---
+import requests
+import shutil
+def auto_update():
+    try:
+        GITHUB_RAW_URL = "https://raw.githubusercontent.com/tysonsylvester/ModuWorks/main/ModuWorks.py"
+        resp = requests.get(GITHUB_RAW_URL, timeout=10)
+        if resp.status_code != 200:
+            print("Could not reach GitHub for updates.")
+            return
+        latest_content = resp.text
+        for line in latest_content.splitlines():
+            if line.startswith("__version__"):
+                latest_version = line.split("=")[1].strip().strip('"').strip("'")
+                break
         else:
-            print("Unknown choice.")
+            print("Could not detect version in GitHub file.")
+            return
+        if latest_version == __version__:
+            return
+        print(f"New version available: {latest_version} (current: {__version__})")
+        resp = input("Do you want to update now? (y/n): ").strip().lower()
+        if resp != "y":
+            return
+        current_script = Path(__file__).resolve()
+        backup_path = current_script.with_suffix(".bak")
+        shutil.copy2(current_script, backup_path)
+        with tempfile.NamedTemporaryFile("w", delete=False, dir=current_script.parent) as tmp_file:
+            tmp_file.write(latest_content)
+            temp_path = Path(tmp_file.name)
+        shutil.move(temp_path, current_script)
+        print("Update successful! Please restart the script to use the new version.")
+    except Exception as e:
+        print(f"Update failed: {e}")
 
-# ---------- Main Menu ----------
+# --- Main Menu ---
 def main_menu(user):
     while True:
         print(f"\n--- ModuWorks Main Menu (User: {user['username']}) ---")
@@ -384,9 +355,8 @@ def main_menu(user):
         print("3) Delete Note")
         print("4) Record Audio")
         print("5) Settings")
-        print("6) Help")
-        print("7) Logout")
-        print("8) Exit")
+        print("6) Logout")
+        print("7) Exit")
         choice = input("Choice: ").strip()
         if choice == "1":
             add_note(user['id'])
@@ -417,20 +387,19 @@ def main_menu(user):
         elif choice == "5":
             settings_menu(user)
         elif choice == "6":
-            help_menu()
-        elif choice == "7":
             print("Logging out.")
             break
-        elif choice == "8" or choice.lower() in ("q", "quit", "exit"):
+        elif choice == "7" or choice.lower() in ("q", "quit", "exit"):
             print("Goodbye.")
             exit()
         else:
             print("Unknown option.")
 
-# ---------- Bootstrap ----------
+# --- Bootstrap ---
 def bootstrap():
     init_db()
-    print(f"Welcome to {APP_NAME}!")
+    print(f"Welcome to {APP_NAME} (version {__version__})")
+    auto_update()
     while True:
         print("\nPlease choose from one of the following options:")
         print("1) Login")
